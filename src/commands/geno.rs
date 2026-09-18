@@ -854,6 +854,7 @@ fn load_node_filters(mask: Option<&Path>, weights: Option<&Path>) -> Result<Node
 
 fn parse_panplexity_mask(path: &Path) -> Result<HashSet<String>> {
     let mut excluded = HashSet::new();
+    let mut line_no = 0usize;
     for line in read_text_lines(path)? {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -864,7 +865,19 @@ fn parse_panplexity_mask(path: &Path) -> Result<HashSet<String>> {
             continue;
         }
 
+        line_no += 1;
+
+        // panplexity writes one bare 0/1 per line, in node order, with NO node-ID
+        // column (0 = low-complexity/exclude, 1 = normal/keep). A single numeric
+        // field is that positional format -- the node ID is the line's ordinal
+        // position, not the literal value on the line.
         if fields.len() == 1 {
+            if let Ok(v) = fields[0].parse::<f64>() {
+                if v == 0.0 {
+                    excluded.insert(normalize_node_id(&line_no.to_string()));
+                }
+                continue;
+            }
             excluded.insert(normalize_node_id(fields[0]));
             continue;
         }
@@ -886,13 +899,22 @@ fn parse_panplexity_mask(path: &Path) -> Result<HashSet<String>> {
 
 fn parse_panplexity_weights(path: &Path) -> Result<HashMap<String, f64>> {
     let mut weights = HashMap::new();
+    let mut line_no = 0usize;
     for line in read_text_lines(path)? {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let fields = split_filter_line(trimmed);
-        if fields.len() < 2 || looks_like_header(&fields) {
+        if fields.is_empty() || looks_like_header(&fields) {
+            continue;
+        }
+        line_no += 1;
+
+        if fields.len() == 1 {
+            if let Ok(w) = fields[0].parse::<f64>() {
+                weights.insert(normalize_node_id(&line_no.to_string()), w.max(0.0));
+            }
             continue;
         }
 
@@ -1236,6 +1258,30 @@ mod tests {
         assert_eq!(parsed_weights.get("1"), Some(&1.0));
         assert_eq!(parsed_weights.get("2"), Some(&0.25));
         assert_eq!(parsed_weights.get("3"), Some(&0.0));
+    }
+
+    #[test]
+    fn test_parse_panplexity_positional_format() {
+        // panplexity writes one bare value per line, in node order, with no ID
+        // column: the line's ordinal position is the node ID.
+        let dir = TempDir::new().unwrap();
+        let mask = dir.path().join("positional.mask");
+        let weights = dir.path().join("positional.weights.txt");
+
+        fs::write(&mask, "1\n1\n0\n1\n0\n").unwrap();
+        fs::write(&weights, "1.0\n0.5\n0.0\n0.25\n").unwrap();
+
+        let excluded = parse_panplexity_mask(&mask).unwrap();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.contains("3"));
+        assert!(excluded.contains("5"));
+        assert!(!excluded.contains("1"));
+
+        let parsed_weights = parse_panplexity_weights(&weights).unwrap();
+        assert_eq!(parsed_weights.get("1"), Some(&1.0));
+        assert_eq!(parsed_weights.get("2"), Some(&0.5));
+        assert_eq!(parsed_weights.get("3"), Some(&0.0));
+        assert_eq!(parsed_weights.get("4"), Some(&0.25));
     }
 
     #[test]

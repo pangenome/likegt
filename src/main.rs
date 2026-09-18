@@ -190,15 +190,15 @@ enum Commands {
         format: String,
     },
 
-    /// Genotype an externally aligned BAM/CRAM over a reference region
+    /// Genotype reads from an external alignment (BAM/CRAM) or from raw sequences (FASTA/FASTQ)
     Geno {
-        /// Input BAM/CRAM aligned to an external reference
+        /// Input BAM/CRAM aligned to an external reference, or FASTA/FASTQ with raw reads
         #[arg(short = 'b', long = "alignment", visible_alias = "bam", visible_alias = "cram")]
         alignment: String,
 
-        /// Region to extract from the alignment, in samtools format (for example chr6:29600000-29720000)
+        /// Region to extract from the alignment, in samtools format (for example chr6:29600000-29720000); required for BAM/CRAM, ignored for FASTA/FASTQ
         #[arg(short, long)]
-        region: String,
+        region: Option<String>,
 
         /// Pangenome graph to genotype against
         #[arg(short, long)]

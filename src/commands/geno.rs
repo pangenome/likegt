@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -17,7 +17,7 @@ use crate::validation;
 #[derive(Debug, Clone)]
 pub struct GenoConfig {
     pub alignment: String,
-    pub region: String,
+    pub region: Option<String>,
     pub graph: String,
     pub index_sequence: Option<String>,
     pub alignment_reference: Option<String>,
@@ -118,7 +118,7 @@ struct GenotypeInputs {
     panplexity_nodes_excluded: usize,
 }
 
-/// Genotype an externally aligned BAM/CRAM region by realigning reads to graph paths.
+/// Genotype an externally aligned BAM/CRAM region, or raw FASTA/FASTQ reads, by realigning reads to graph paths.
 pub async fn run_geno(config: GenoConfig) -> Result<GenoRunResult> {
     validate_config(&config)?;
 
@@ -135,31 +135,64 @@ pub async fn run_geno(config: GenoConfig) -> Result<GenoRunResult> {
     if config.verbose {
         println!("Starting genotyping for sample {}", sample_id);
         println!("  Alignment: {}", config.alignment);
-        println!("  Region: {}", config.region);
+        if let Some(region) = &config.region {
+            println!("  Region: {}", region);
+        }
         println!("  Graph: {}", config.graph);
+    }
+
+    let input_format = detect_input_format(Path::new(&config.alignment))?;
+    if config.verbose {
+        println!("  Input format: {}", input_format);
+    }
+
+    let reads_extracted = match input_format {
+        InputFormat::Fasta | InputFormat::Fastq => {
+            if config.region.is_some() {
+                println!("Warning: --region was supplied but the input is a plain sequence file; the region will be ignored");
+            }
+            if config.min_mapq > 0 || config.exclude_flags != "0x904" {
+                println!("Warning: --min-mapq/--exclude-flags only apply to BAM/CRAM inputs and are ignored for sequence inputs");
+            }
+            prepare_sequence_reads(Path::new(&config.alignment), input_format, &files.reads_fastq)?
+        }
+        InputFormat::Bam | InputFormat::Cram => {
+            let region = config.region.as_deref().unwrap_or("");
+            if region.is_empty() {
+                bail!("--region is required when the input is a BAM/CRAM alignment");
+            }
+            extract_region_bam(&config, region, &files.region_bam)?;
+            count_bam_records(&files.region_bam, false, config.threads)?
+        }
+    };
+
+    let reads_written_to_fastq = match input_format {
+        InputFormat::Fasta | InputFormat::Fastq => reads_extracted,
+        InputFormat::Bam | InputFormat::Cram => {
+            bam_to_fastq(
+                &files.region_bam,
+                &files.name_sorted_bam,
+                &files.reads_fastq,
+                config.threads,
+            )?;
+            count_fastq_reads(&files.reads_fastq)?
+        }
+    };
+    if reads_written_to_fastq == 0 {
+        bail!(
+            "No reads were extracted from {}{}",
+            config.alignment,
+            config
+                .region
+                .as_deref()
+                .map(|region| format!(" in region {}", region))
+                .unwrap_or_default()
+        );
     }
 
     let reference_coverage = prepare_reference_coverage(&config, &files)?;
     let index_sequence = prepare_index_sequence(&config, &files)?;
     let (mask_path, weights_path) = resolve_panplexity_files(&config)?;
-
-    extract_region_bam(&config, &files.region_bam)?;
-    let reads_extracted = count_bam_records(&files.region_bam, false, config.threads)?;
-
-    bam_to_fastq(
-        &files.region_bam,
-        &files.name_sorted_bam,
-        &files.reads_fastq,
-        config.threads,
-    )?;
-    let reads_written_to_fastq = count_fastq_reads(&files.reads_fastq)?;
-    if reads_written_to_fastq == 0 {
-        bail!(
-            "No reads were extracted from {} in region {}",
-            config.alignment,
-            config.region
-        );
-    }
 
     realign_reads(
         &config,
@@ -209,7 +242,7 @@ pub async fn run_geno(config: GenoConfig) -> Result<GenoRunResult> {
     let result = GenoRunResult {
         sample_id: sample_id.clone(),
         alignment: config.alignment.clone(),
-        region: config.region.clone(),
+        region: config.region.clone().unwrap_or_default(),
         graph: config.graph.clone(),
         ploidy: config.ploidy,
         aligner: config.aligner.clone(),
@@ -412,9 +445,9 @@ fn resolve_panplexity_files(config: &GenoConfig) -> Result<(Option<PathBuf>, Opt
     Ok((mask, weights))
 }
 
-fn extract_region_bam(config: &GenoConfig, output_bam: &Path) -> Result<()> {
+fn extract_region_bam(config: &GenoConfig, region: &str, output_bam: &Path) -> Result<()> {
     if config.verbose {
-        println!("Extracting BAM/CRAM region {}", config.region);
+        println!("Extracting BAM/CRAM region {}", region);
     }
 
     let samtools = require_tool("samtools")?;
@@ -436,11 +469,156 @@ fn extract_region_bam(config: &GenoConfig, output_bam: &Path) -> Result<()> {
         command.arg("-T").arg(reference);
     }
 
-    command.arg(&config.alignment).arg(&config.region);
+    command.arg(&config.alignment).arg(region);
     run_checked(
         &mut command,
         "samtools view failed while extracting the requested region",
     )
+}
+
+/// Supported input formats for `likegt geno`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFormat {
+    Bam,
+    Cram,
+    Fasta,
+    Fastq,
+}
+
+impl std::fmt::Display for InputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            InputFormat::Bam => "BAM",
+            InputFormat::Cram => "CRAM",
+            InputFormat::Fasta => "FASTA",
+            InputFormat::Fastq => "FASTQ",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+/// Detect the format of the input file by sniffing its content,
+/// so that gzipped files and misleading extensions still work.
+fn detect_input_format(path: &Path) -> Result<InputFormat> {
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 6];
+    reader.read(&mut magic)?;
+
+    // BAM is BGZF (gzip) compressed, so the "BAM\x01" magic lives inside
+    // the decompressed stream; only uncompressed BAM starts with it directly.
+    let format = if magic.starts_with(b"BAM\x01") {
+        InputFormat::Bam
+    } else if magic.starts_with(b"CRAM") {
+        InputFormat::Cram
+    } else if magic.starts_with(&[0x1f, 0x8b]) {
+        // gzip / BGZF: decompress and inspect the payload
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(GzDecoder::new(file));
+        let mut payload = [0u8; 4];
+        reader.read_exact(&mut payload)?;
+        if payload == *b"BAM\x01" {
+            InputFormat::Bam
+        } else if payload == *b"CRAM" {
+            InputFormat::Cram
+        } else {
+            sniff_text_format(path, true)?
+        }
+    } else {
+        sniff_text_format(path, false)?
+    };
+    Ok(format)
+}
+
+/// Sniff the first non-empty line of a plain-text (FASTA/FASTQ) file.
+fn sniff_text_format(path: &Path, gzipped: bool) -> Result<InputFormat> {
+    let file = File::open(path)?;
+    let mut reader: Box<dyn BufRead> = if gzipped {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.starts_with('>') {
+        Ok(InputFormat::Fasta)
+    } else if trimmed.starts_with('@') && !trimmed.is_empty() {
+        Ok(InputFormat::Fastq)
+    } else {
+        bail!(
+            "Unable to determine the format of {}: expected BAM, CRAM, FASTA or FASTQ",
+            path.display()
+        )
+    }
+}
+
+/// Convert FASTA (or pass through FASTQ) reads to a FASTQ work file,
+/// returning the number of reads written. Handles gzipped inputs.
+fn prepare_sequence_reads(input: &Path, format: InputFormat, output_fastq: &Path) -> Result<usize> {
+    let file = File::open(input).with_context(|| format!("Failed to open {}", input.display()))?;
+    let reader: Box<dyn BufRead> = if input
+        .to_string_lossy()
+        .ends_with(".gz")
+    {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
+    let out_file =
+        File::create(output_fastq).with_context(|| format!("Failed to create {}", output_fastq.display()))?;
+    let mut writer = BufWriter::new(out_file);
+
+    if format == InputFormat::Fastq {
+        let mut count = 0usize;
+        for line in reader.lines() {
+            let line = line?;
+            if line.starts_with('@') {
+                count += 1;
+            }
+            writeln!(writer, "{}", line)?;
+        }
+        return Ok(count);
+    }
+
+    // FASTA -> FASTQ with dummy qualities
+    let mut count = 0usize;
+    let mut name = String::new();
+    let mut sequence = String::new();
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('>') {
+            if !name.is_empty() {
+                write_fastq_record(&mut writer, &name, &sequence)?;
+                count += 1;
+                sequence.clear();
+            }
+            name = header.split_whitespace().next().unwrap_or("").to_string();
+            if name.is_empty() {
+                bail!("FASTA record with empty header in {}", input.display());
+            }
+        } else {
+            sequence.push_str(line);
+        }
+    }
+    if !name.is_empty() {
+        write_fastq_record(&mut writer, &name, &sequence)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn write_fastq_record<W: Write>(writer: &mut W, name: &str, sequence: &str) -> Result<()> {
+    writeln!(writer, "@{}", name)?;
+    writeln!(writer, "{}", sequence)?;
+    writeln!(writer, "+")?;
+    writeln!(writer, "{}", "I".repeat(sequence.len()))?;
+    Ok(())
 }
 
 fn bam_to_fastq(
@@ -1231,6 +1409,16 @@ fn derive_sample_id(alignment: &str) -> String {
         .trim_end_matches(".bam")
         .trim_end_matches(".cram")
         .trim_end_matches(".sam")
+        .trim_end_matches(".fa.gz")
+        .trim_end_matches(".fasta.gz")
+        .trim_end_matches(".fna.gz")
+        .trim_end_matches(".fq.gz")
+        .trim_end_matches(".fastq.gz")
+        .trim_end_matches(".fa")
+        .trim_end_matches(".fasta")
+        .trim_end_matches(".fna")
+        .trim_end_matches(".fq")
+        .trim_end_matches(".fastq")
         .to_string()
 }
 
@@ -1238,6 +1426,51 @@ fn derive_sample_id(alignment: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_detect_and_convert_sequence_inputs() {
+        let dir = TempDir::new().unwrap();
+
+        let fasta = dir.path().join("reads.fa");
+        fs::write(&fasta, ">r1 desc\nACGTACGT\nAC\n>r2\nTTTT\n").unwrap();
+        assert_eq!(detect_input_format(&fasta).unwrap(), InputFormat::Fasta);
+
+        let fastq = dir.path().join("reads.fq");
+        fs::write(&fastq, "@r1\nACGTACGT\n+\nIIIIIIII\n").unwrap();
+        assert_eq!(detect_input_format(&fastq).unwrap(), InputFormat::Fastq);
+
+        let gz = dir.path().join("reads.fa.gz");
+        let mut encoder = GzEncoder::new(File::create(&gz).unwrap(), Compression::default());
+        encoder.write_all(b">r1\nACGT\n").unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(detect_input_format(&gz).unwrap(), InputFormat::Fasta);
+
+        let bam_like = dir.path().join("fake.bam");
+        fs::write(&bam_like, b"BAM\x01garbage").unwrap();
+        assert_eq!(detect_input_format(&bam_like).unwrap(), InputFormat::Bam);
+
+        // Real BAM files are BGZF/gzip compressed: the BAM magic sits inside
+        // the decompressed stream.
+        let bgzf_bam = dir.path().join("real_like.bam");
+        let mut encoder = GzEncoder::new(File::create(&bgzf_bam).unwrap(), Compression::default());
+        encoder.write_all(b"BAM\x01bgzf-payload").unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(detect_input_format(&bgzf_bam).unwrap(), InputFormat::Bam);
+
+        // FASTA -> FASTQ conversion with dummy qualities
+        let out_fq = dir.path().join("out.fq");
+        let count = prepare_sequence_reads(&fasta, InputFormat::Fasta, &out_fq).unwrap();
+        assert_eq!(count, 2);
+        let content = fs::read_to_string(&out_fq).unwrap();
+        assert!(content.starts_with("@r1\nACGTACGTAC\n+\nIIIIIIIIII\n"));
+        assert!(content.contains("@r2\nTTTT\n+\nIIII\n"));
+
+        // FASTQ passthrough
+        let pass_fq = dir.path().join("pass.fq");
+        let count = prepare_sequence_reads(&fastq, InputFormat::Fastq, &pass_fq).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(fs::read_to_string(&pass_fq).unwrap(), "@r1\nACGTACGT\n+\nIIIIIIII\n");
+    }
 
     #[test]
     fn test_parse_panplexity_mask_and_weights() {
@@ -1403,7 +1636,7 @@ mod tests {
 
         let result = run_geno(GenoConfig {
             alignment: sorted_bam.to_string_lossy().to_string(),
-            region: "chr1:1-240".to_string(),
+            region: Some("chr1:1-240".to_string()),
             graph: graph.to_string_lossy().to_string(),
             index_sequence: Some(graph_paths.to_string_lossy().to_string()),
             alignment_reference: None,

@@ -185,7 +185,7 @@ likegt hold-out -f sequences.fa.gz -g graph.gfa -i "HG00096,HG00171,HG00268" -v
 likegt hold-out -f sequences.fa.gz -g graph.gfa -i all --format tsv > results.tsv
 ```
 
-### 2. Genotype an External BAM/CRAM Region
+### 2. Genotype an External BAM/CRAM Region or Raw FASTA/FASTQ Reads
 
 ```bash
 likegt geno \
@@ -195,6 +195,9 @@ likegt geno \
   --index-sequence hla.graph_paths.fa \
   --sample HG00096 \
   --output geno_results
+
+# Raw reads work too: --region is not needed (and ignored) for FASTA/FASTQ input
+likegt geno -b reads.fa -g hla.gfa -x hla.graph_paths.fa -s HG00096 -o geno_results
 
 # Optionally exclude Panplexity-masked nodes from COSIGT scoring
 likegt geno -b sample.cram -r chr6:29600000-29720000 -g hla.gfa \
@@ -286,13 +289,13 @@ The hold-out validation pipeline evaluates genotyping accuracy by simulating a r
 - `--format`: Output format (text, json, csv, tsv, table)
 - `-v, --verbose`: Verbose output
 
-### `geno` - External BAM/CRAM Genotyping
+### `geno` - External BAM/CRAM or FASTA/FASTQ Genotyping
 
-Genotypes reads from an existing BAM/CRAM alignment. The command extracts reads from a samtools-style region, converts them to FASTQ, realigns them to graph path sequences, projects the alignments into the graph with `gfainject`, calculates node coverage with `gafpack`, and ranks the closest haplotype combinations with COSIGT.
+Genotypes reads from an existing BAM/CRAM alignment or from raw FASTA/FASTQ sequences. For BAM/CRAM, the command extracts reads from a samtools-style region, converts them to FASTQ, realigns them to graph path sequences, projects the alignments into the graph with `gfainject`, calculates node coverage with `gafpack`, and ranks the closest haplotype combinations with COSIGT. For FASTA/FASTQ input, all reads are used directly (no region extraction; FASTA is converted to FASTQ with dummy qualities).
 
 **Options:**
-- `-b, --alignment`: Input BAM/CRAM aligned to an external reference
-- `-r, --region`: Region to extract, such as `chr6:29600000-29720000`
+- `-b, --alignment`: Input BAM/CRAM aligned to an external reference, or FASTA/FASTQ with raw reads (plain or gzipped)
+- `-r, --region`: Region to extract from a BAM/CRAM, such as `chr6:29600000-29720000`; required for BAM/CRAM, ignored for FASTA/FASTQ
 - `-g, --graph`: Pangenome graph to genotype against
 - `-x, --index-sequence`: FASTA of graph paths to align against; existing BWA indexes are reused
 - `--alignment-reference`: Reference FASTA for CRAM decoding

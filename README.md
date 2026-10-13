@@ -300,7 +300,8 @@ Genotypes reads from an existing BAM/CRAM alignment or from raw FASTA/FASTQ sequ
 - `-x, --index-sequence`: FASTA of graph paths to align against; existing BWA indexes are reused
 - `--alignment-reference`: Reference FASTA for CRAM decoding
 - `--reference-coverage`: Existing graph path coverage TSV(.gz); otherwise generated with `odgi paths -H`
-- `--aligner`: Realigner (`minimap2`, default; or `bwa-mem`)
+- `--aligner`: Realigner (`minimap2`, default; or `bwa-mem`, `bwa-mem2`, `bwa-aln`)
+- `--ancient`: Use bwa aln with ancient-DNA settings (`-l 1024 -n 0.01 -o 2`); implies `--aligner bwa-aln` (paired reads are split by /1,//2 and realigned with bwa sampe, orphan mates dropped)
 - `--panplexity`: Auto-load sibling `*.panplexity.mask` or `*.panplexity.weights.txt` files
 - `--panplexity-mask`: Exclude masked/low-complexity graph nodes from COSIGT scoring
 - `--panplexity-weights`: Use per-node weights in weighted cosine similarity

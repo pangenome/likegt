@@ -27,7 +27,11 @@ pub struct GenoConfig {
     pub ploidy: usize,
     pub threads: usize,
     pub aligner: String,
+    pub ancient: bool,
     pub preset: String,
+    pub bwa_hits: u32,
+    pub paired: bool,
+    pub coverage_outlier_filter: bool,
     pub no_build_index: bool,
     pub min_mapq: u32,
     pub exclude_flags: String,
@@ -119,7 +123,11 @@ struct GenotypeInputs {
 }
 
 /// Genotype an externally aligned BAM/CRAM region, or raw FASTA/FASTQ reads, by realigning reads to graph paths.
-pub async fn run_geno(config: GenoConfig) -> Result<GenoRunResult> {
+pub async fn run_geno(mut config: GenoConfig) -> Result<GenoRunResult> {
+    if config.ancient {
+        println!("--ancient: using bwa aln with ancient-DNA settings (-l 1024 -n 0.01 -o 2)");
+        config.aligner = "bwa-aln".to_string();
+    }
     validate_config(&config)?;
 
     fs::create_dir_all(&config.output_dir)
@@ -212,6 +220,7 @@ pub async fn run_geno(config: GenoConfig) -> Result<GenoRunResult> {
         &files.sample_coverage,
         &filters,
         &config.exclude_haplotype_patterns,
+        config.coverage_outlier_filter,
     )?;
 
     let combinations = evaluate_genotypes(&inputs, config.ploidy, config.threads)?;
@@ -301,8 +310,8 @@ fn validate_config(config: &GenoConfig) -> Result<()> {
         }
     }
     match config.aligner.as_str() {
-        "minimap2" | "bwa-mem" | "bwa" => {}
-        other => bail!("Unsupported aligner '{}'. Use minimap2 or bwa-mem.", other),
+        "minimap2" | "bwa-mem" | "bwa" | "bwa-mem2" | "bwa-aln" => {}
+        other => bail!("Unsupported aligner '{}'. Use minimap2, bwa-mem, bwa-mem2 or bwa-aln.", other),
     }
 
     require_tool("samtools")?;
@@ -312,8 +321,11 @@ fn validate_config(config: &GenoConfig) -> Result<()> {
         "minimap2" => {
             require_tool("minimap2")?;
         }
-        "bwa-mem" | "bwa" => {
+        "bwa-mem" | "bwa" | "bwa-aln" => {
             require_tool("bwa")?;
+        }
+        "bwa-mem2" => {
+            require_tool("bwa-mem2")?;
         }
         _ => {}
     }
@@ -677,7 +689,11 @@ fn realign_reads(
             command
                 .args(["-ax", &config.preset, "-t"])
                 .arg(config.threads.to_string())
-                .arg("--secondary=no")
+                .arg("--secondary=no");
+            if config.paired {
+                command.arg("-X");
+            }
+            command
                 .arg(target)
                 .arg(reads_fastq)
                 .stdout(Stdio::from(output_file))
@@ -691,9 +707,11 @@ fn realign_reads(
             ensure_bwa_index(target, !config.no_build_index, config.verbose)?;
             let bwa = require_tool("bwa")?;
             let mut command = Command::new(bwa);
+            command.args(["mem", "-t"]).arg(config.threads.to_string());
+            if config.paired {
+                command.arg("-p");
+            }
             command
-                .args(["mem", "-t"])
-                .arg(config.threads.to_string())
                 .arg(target)
                 .arg(reads_fastq)
                 .stdout(Stdio::from(output_file))
@@ -702,6 +720,133 @@ fn realign_reads(
                 &mut command,
                 "bwa mem failed while realigning reads to graph paths",
             )
+        }
+        "bwa-mem2" => {
+            ensure_bwa_mem2_index(target, !config.no_build_index, config.verbose)?;
+            let bwa2 = require_tool("bwa-mem2")?;
+            let mut command = Command::new(bwa2);
+            command.args(["mem", "-t"]).arg(config.threads.to_string());
+            if config.paired {
+                command.arg("-p");
+            }
+            command
+                .arg("-h")
+                .arg(config.bwa_hits.to_string())
+                .arg(target)
+                .arg(reads_fastq)
+                .stdout(Stdio::from(output_file))
+                .stderr(Stdio::piped());
+            run_checked(
+                &mut command,
+                "bwa-mem2 mem failed while realigning reads to graph paths",
+            )
+        }
+        "bwa-aln" => {
+            ensure_bwa_index(target, !config.no_build_index, config.verbose)?;
+            let bwa = require_tool("bwa")?;
+            if config.paired {
+                // Split reads into R1/R2 by /1,/2 name suffix; orphaned mates are dropped.
+                let r1 = output_sam.with_extension("r1.fq");
+                let r2 = output_sam.with_extension("r2.fq");
+                let (pairs, dropped) = split_reads_by_mate(reads_fastq, &r1, &r2)?;
+                if config.verbose {
+                    println!(
+                        "bwa-aln paired mode: {} pairs, {} orphan reads dropped",
+                        pairs, dropped
+                    );
+                }
+                let sai1 = output_sam.with_extension("r1.sai");
+                let sai2 = output_sam.with_extension("r2.sai");
+                let sai1_file = File::create(&sai1)
+                    .with_context(|| format!("Failed to create {}", sai1.display()))?;
+                let mut aln1 = Command::new(&bwa);
+                aln1
+                    .args(["aln", "-l", "1024", "-n", "0.01", "-o", "2", "-t"])
+                    .arg(config.threads.to_string())
+                    .arg(target)
+                    .arg(&r1)
+                    .stdout(Stdio::from(sai1_file))
+                    .stderr(Stdio::piped());
+                run_checked(
+                    &mut aln1,
+                    "bwa aln failed while realigning read1 to graph paths",
+                )?;
+                let sai2_file = File::create(&sai2)
+                    .with_context(|| format!("Failed to create {}", sai2.display()))?;
+                let mut aln2 = Command::new(&bwa);
+                aln2
+                    .args(["aln", "-l", "1024", "-n", "0.01", "-o", "2", "-t"])
+                    .arg(config.threads.to_string())
+                    .arg(target)
+                    .arg(&r2)
+                    .stdout(Stdio::from(sai2_file))
+                    .stderr(Stdio::piped());
+                run_checked(
+                    &mut aln2,
+                    "bwa aln failed while realigning read2 to graph paths",
+                )?;
+                let mut sampe = Command::new(&bwa);
+                sampe
+                    .arg("sampe")
+                    .arg(target)
+                    .arg(&sai1)
+                    .arg(&sai2)
+                    .arg(&r1)
+                    .arg(&r2)
+                    .stdout(Stdio::from(output_file))
+                    .stderr(Stdio::piped());
+                run_checked(
+                    &mut sampe,
+                    "bwa sampe failed while realigning reads to graph paths",
+                )?;
+                for p in [&r1, &r2, &sai1, &sai2] {
+                    let _ = fs::remove_file(p);
+                }
+            } else {
+                let sai = output_sam.with_extension("sai");
+                let sai_file = File::create(&sai)
+                    .with_context(|| format!("Failed to create {}", sai.display()))?;
+                let mut aln = Command::new(&bwa);
+                aln
+                    .args(["aln", "-l", "1024", "-n", "0.01", "-o", "2", "-t"])
+                    .arg(config.threads.to_string())
+                    .arg(target)
+                    .arg(reads_fastq)
+                    .stdout(Stdio::from(sai_file))
+                    .stderr(Stdio::piped());
+                run_checked(
+                    &mut aln,
+                    "bwa aln failed while realigning reads to graph paths",
+                )?;
+                let mut samse = Command::new(&bwa);
+                samse
+                    .arg("samse")
+                    .arg(target)
+                    .arg(&sai)
+                    .arg(reads_fastq)
+                    .stdout(Stdio::from(output_file))
+                    .stderr(Stdio::piped());
+                run_checked(
+                    &mut samse,
+                    "bwa samse failed while realigning reads to graph paths",
+                )?;
+                let _ = fs::remove_file(&sai);
+            }
+            // bwa aln/samse/sampe can emit alignments extending past the end of
+            // the target sequence (POS + query length > LN); bwa mem clamps these,
+            // bwa aln does not. gfainject/gafpack produce invalid (uint32-wrapped,
+            // negative) node coordinates for such records, so drop them before
+            // SAM->BAM conversion.
+            let filtered_sam = output_sam.with_extension("overflow_filtered.sam");
+            let (kept, dropped_overflow) = filter_sam_overflow(output_sam, &filtered_sam)?;
+            if config.verbose && dropped_overflow > 0 {
+                println!(
+                    "bwa-aln: dropped {} alignments extending past target end ({} kept)",
+                    dropped_overflow, kept
+                );
+            }
+            fs::rename(&filtered_sam, output_sam)?;
+            Ok(())
         }
         other => bail!("Unsupported aligner '{}'", other),
     }
@@ -777,6 +922,7 @@ fn build_genotype_inputs(
     sample_path: &Path,
     filters: &NodeFilters,
     exclude_haplotype_patterns: &[String],
+    coverage_outlier_filter: bool,
 ) -> Result<GenotypeInputs> {
     let reference = read_coverage_table(reference_path)?;
     let sample = read_coverage_table(sample_path)?;
@@ -785,6 +931,54 @@ fn build_genotype_inputs(
     }
 
     let sample_lookup = build_column_lookup(&sample.columns);
+
+    // Coverage-outlier node filter (COSIGT paper, 'Node filtering' stage):
+    // flag nodes whose mean copy number across ALL reference (haplotype) paths
+    // falls outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR]. Excluded nodes combine with
+    // (logical AND) the panplexity mask: a node is scored only if it passes
+    // both filters.
+    let mut excluded: std::collections::HashSet<String> = filters.excluded.clone();
+    if coverage_outlier_filter {
+        let mut means: Vec<(usize, f64)> = Vec::new();
+        for (ref_idx, ref_col) in reference.columns.iter().enumerate() {
+            if is_metadata_column(ref_col) {
+                continue;
+            }
+            let mut sum = 0.0f64;
+            let mut n = 0.0f64;
+            for row in &reference.values {
+                sum += row[ref_idx];
+                n += 1.0;
+            }
+            if n > 0.0 {
+                means.push((ref_idx, sum / n));
+            }
+        }
+        let mut vals: Vec<f64> = means.iter().map(|m| m.1).collect();
+        if vals.len() >= 4 {
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let q1 = quantile_r7(&vals, 0.25);
+            let q3 = quantile_r7(&vals, 0.75);
+            let iqr = q3 - q1;
+            let lower = q1 - 1.5 * iqr;
+            let upper = q3 + 1.5 * iqr;
+            let mut n_out = 0usize;
+            for (ref_idx, mean) in &means {
+                if *mean < lower || *mean > upper {
+                    if excluded.insert(normalize_node_id(&reference.columns[*ref_idx])) {
+                        n_out += 1;
+                    }
+                }
+            }
+            println!(
+                "coverage-outlier filter: excluded {} of {} nodes (bounds [{:.4}, {:.4}] on mean path copy number)",
+                n_out,
+                means.len(),
+                lower,
+                upper
+            );
+        }
+    }
     let mut node_pairs = Vec::new();
     let mut common_nodes = 0usize;
     let mut excluded_by_panplexity = 0usize;
@@ -800,7 +994,7 @@ fn build_genotype_inputs(
 
         common_nodes += 1;
         let normalized = normalize_node_id(ref_col);
-        if filters.excluded.contains(&normalized) {
+        if excluded.contains(&normalized) {
             excluded_by_panplexity += 1;
             continue;
         }
@@ -1010,6 +1204,24 @@ fn find_matching_column(column: &str, lookup: &HashMap<String, usize>) -> Option
         .get(column)
         .copied()
         .or_else(|| lookup.get(&normalize_node_id(column)).copied())
+}
+
+/// R's quantile() default (type 7) on a sorted slice, for exact parity with
+/// the COSIGT reference coverage_outliers.r.
+fn quantile_r7(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let h = p * (n as f64 - 1.0);
+    let idx = h.floor() as usize;
+    let gamma = h - idx as f64;
+    let x0 = sorted[idx];
+    let x1 = if idx + 1 < n { sorted[idx + 1] } else { sorted[idx] };
+    (1.0 - gamma) * x0 + gamma * x1
 }
 
 fn is_metadata_column(column: &str) -> bool {
@@ -1380,6 +1592,199 @@ fn ensure_bwa_index(target: &Path, build_if_missing: bool, verbose: bool) -> Res
     run_checked(&mut command, "bwa index failed")
 }
 
+fn ensure_bwa_mem2_index(target: &Path, build_if_missing: bool, verbose: bool) -> Result<()> {
+    let required = ["0123", "bwt.2bit.64", "amb", "ann", "pac"];
+    let missing = required
+        .iter()
+        .any(|suffix| !PathBuf::from(format!("{}.{}", target.to_string_lossy(), suffix)).exists());
+
+    if !missing {
+        return Ok(());
+    }
+
+    if !build_if_missing {
+        bail!(
+            "BWA-MEM2 index is missing for {} and --no-build-index was supplied",
+            target.display()
+        );
+    }
+
+    if verbose {
+        println!(
+            "BWA-MEM2 index missing for {}; building it once",
+            target.display()
+        );
+    }
+
+    let bwa2 = require_tool("bwa-mem2")?;
+    let mut command = Command::new(bwa2);
+    command.arg("index").arg(target);
+    run_checked(&mut command, "bwa-mem2 index failed")
+}
+
+/// Split a reads file (FASTA or FASTQ) into R1/R2 files by /1,/2 name suffix.
+/// Only complete pairs (both mates present) are written, sorted by read name so
+/// that bwa sampe sees the mates in matching order. Records without a /1 or /2
+/// suffix, and orphans whose mate is absent, are dropped.
+/// Returns (pairs_written, reads_dropped).
+fn split_reads_by_mate(input: &Path, out_r1: &Path, out_r2: &Path) -> Result<(usize, usize)> {
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+
+    let f = File::open(input)
+        .with_context(|| format!("Failed to open {}", input.display()))?;
+    let reader = BufReader::new(f);
+    let mut lines = reader.lines();
+
+    let mut m1: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut m2: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut dropped: usize = 0;
+
+    while let Some(Ok(header)) = lines.next() {
+        if header.is_empty() {
+            continue;
+        }
+        let first = header.chars().next().unwrap_or('>');
+        let n_extra = if first == '@' {
+            3
+        } else if first == '>' {
+            1
+        } else {
+            bail!("Unrecognized record header in {}: {}", input.display(), header);
+        };
+        let mut record = vec![header];
+        for _ in 0..n_extra {
+            match lines.next() {
+                Some(Ok(l)) => record.push(l),
+                _ => bail!("Truncated record in {}", input.display()),
+            }
+        }
+        let hdr = record[0].clone();
+        let base = if hdr.len() > 2 && (hdr.ends_with("/1") || hdr.ends_with("/2")) {
+            hdr[..hdr.len() - 2].to_string()
+        } else {
+            String::new()
+        };
+        if base.is_empty() {
+            dropped += 1;
+        } else if hdr.ends_with("/1") {
+            if m1.insert(base, record).is_some() {
+                dropped += 1; // duplicate name
+            }
+        } else if m2.insert(base, record).is_some() {
+            dropped += 1; // duplicate name
+        }
+    }
+
+    let mut pairs: usize = 0;
+    {
+        let mut f1 = File::create(out_r1)
+            .with_context(|| format!("Failed to create {}", out_r1.display()))?;
+        let mut f2 = File::create(out_r2)
+            .with_context(|| format!("Failed to create {}", out_r2.display()))?;
+        let mut w1 = BufWriter::new(&mut f1);
+        let mut w2 = BufWriter::new(&mut f2);
+        for (name, rec1) in m1.iter() {
+            if let Some(rec2) = m2.get(name) {
+                for l in rec1 {
+                    writeln!(w1, "{}", l)?;
+                }
+                for l in rec2 {
+                    writeln!(w2, "{}", l)?;
+                }
+                pairs += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        for name in m2.keys() {
+            if !m1.contains_key(name) {
+                dropped += 1;
+            }
+        }
+        w1.flush()?;
+        w2.flush()?;
+    }
+    Ok((pairs, dropped))
+}
+
+/// Drop SAM records whose alignment extends past the end of the target
+/// sequence (POS + consumed query length > LN). Returns (kept, dropped).
+fn filter_sam_overflow(input: &Path, output: &Path) -> Result<(usize, usize)> {
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+
+    let reader = BufReader::new(
+        File::open(input).with_context(|| format!("Failed to open {}", input.display()))?,
+    );
+    let mut out = BufWriter::new(
+        File::create(output)
+            .with_context(|| format!("Failed to create {}", output.display()))?,
+    );
+    let mut lens: HashMap<String, u64> = HashMap::new();
+    let mut kept: usize = 0;
+    let mut dropped: usize = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.starts_with('@') {
+            if let Some(rest) = line.strip_prefix("@SQ\t") {
+                let mut sn = String::new();
+                let mut ln = 0u64;
+                for field in rest.split('\t') {
+                    if let Some(v) = field.strip_prefix("SN:") {
+                        sn = v.to_string();
+                    } else if let Some(v) = field.strip_prefix("LN:") {
+                        ln = v.parse().unwrap_or(0);
+                    }
+                }
+                if !sn.is_empty() {
+                    lens.insert(sn, ln);
+                }
+            }
+            writeln!(out, "{}", line)?;
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 6 {
+            continue; // malformed line
+        }
+        let flag: u32 = f[1].parse().unwrap_or(0);
+        let pos: u64 = f[3].parse().unwrap_or(0);
+        // Only records that actually carry alignment info can overflow. NB:
+        // bwa-aln can emit records flagged unmapped (0x4) that still carry
+        // RNAME/POS/CIGAR -- those must be overflow-checked too.
+        let carries_alignment = pos > 0 && f[2] != "*" && f[5] != "*";
+        let overflow = if !carries_alignment {
+            false
+        } else {
+            // query bases consumed on the reference-side: M/I/S/=/X ops
+            let mut q: u64 = 0;
+            let mut num = String::new();
+            for c in f[5].chars() {
+                if c.is_ascii_digit() {
+                    num.push(c);
+                } else {
+                    if matches!(c, 'M' | 'I' | 'S' | '=' | 'X') {
+                        q += num.parse::<u64>().unwrap_or(0);
+                    }
+                    num.clear();
+                }
+            }
+            let ln = lens.get(f[2]).copied().unwrap_or(u64::MAX);
+            pos + q > ln + 1
+        };
+        let _ = flag;
+        if overflow {
+            dropped += 1;
+        } else {
+            kept += 1;
+            writeln!(out, "{}", line)?;
+        }
+    }
+    out.flush()?;
+    Ok((kept, dropped))
+}
+
 fn write_gzip_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
@@ -1537,7 +1942,7 @@ mod tests {
         fs::write(&mask, "node.2\n").unwrap();
 
         let filters = load_node_filters(Some(&mask), None).unwrap();
-        let inputs = build_genotype_inputs(&reference, &sample, &filters, &[]).unwrap();
+        let inputs = build_genotype_inputs(&reference, &sample, &filters, &[], false).unwrap();
         assert_eq!(inputs.common_nodes, 3);
         assert_eq!(inputs.used_nodes, 2);
         assert_eq!(inputs.panplexity_nodes_excluded, 1);
@@ -1635,6 +2040,7 @@ mod tests {
         .unwrap();
 
         let result = run_geno(GenoConfig {
+            ancient: false,
             alignment: sorted_bam.to_string_lossy().to_string(),
             region: Some("chr1:1-240".to_string()),
             graph: graph.to_string_lossy().to_string(),
@@ -1647,6 +2053,9 @@ mod tests {
             threads: 2,
             aligner: "minimap2".to_string(),
             preset: "sr".to_string(),
+            bwa_hits: 10000,
+            paired: false,
+            coverage_outlier_filter: false,
             no_build_index: false,
             min_mapq: 0,
             exclude_flags: "0x904".to_string(),

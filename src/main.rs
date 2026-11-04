@@ -232,13 +232,32 @@ enum Commands {
         #[arg(short, long, default_value = "4")]
         threads: usize,
 
-        /// Aligner for realigning region reads to graph path sequences (minimap2, bwa-mem)
+        /// Aligner for realigning region reads to graph path sequences (minimap2, bwa-mem, bwa-mem2, bwa-aln)
         #[arg(long, default_value = "minimap2")]
         aligner: String,
+
+        /// Use bwa aln with ancient-DNA settings (-l 1024 -n 0.01 -o 2); implies --aligner bwa-aln
+        #[arg(long)]
+        ancient: bool,
 
         /// Aligner preset, for example sr for short reads or map-ont for ONT
         #[arg(long, default_value = "sr")]
         preset: String,
+
+        /// Multi-mapping hit cap (-h) for --aligner bwa-mem2
+        #[arg(long, default_value = "10000")]
+        bwa_hits: u32,
+
+        /// Treat reads as paired-end: mem aligners get interleaved pairing (-p / minimap2 -X);
+        /// bwa-aln splits mates by /1,/2 suffix and uses bwa sampe (orphan mates dropped)
+        #[arg(long)]
+        paired: bool,
+
+        /// COSIGT-paper node filter: exclude nodes whose mean copy number across
+        /// reference haplotype paths falls outside [Q1-1.5*IQR, Q3+1.5*IQR]
+        /// (combined with the panplexity mask, logical AND)
+        #[arg(long)]
+        coverage_outlier_filter: bool,
 
         /// Do not build a missing BWA index for --index-sequence
         #[arg(long)]
@@ -485,7 +504,11 @@ async fn main() -> Result<()> {
             ploidy,
             threads,
             aligner,
+            ancient,
             preset,
+            bwa_hits,
+            paired,
+            coverage_outlier_filter,
             no_build_index,
             min_mapq,
             exclude_flags,
@@ -510,7 +533,11 @@ async fn main() -> Result<()> {
                 ploidy,
                 threads,
                 aligner,
+                ancient,
                 preset,
+                bwa_hits,
+                paired,
+                coverage_outlier_filter,
                 no_build_index,
                 min_mapq,
                 exclude_flags,
